@@ -2,11 +2,13 @@
 #include "util-tui.h"
 #include "util-rand.h" /* truely random numbers */
 #include "main-pretest.h"
+#include "http-response.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <stdarg.h>
 
 #ifdef _WIN32
 #include "win-sockets.h"
@@ -18,7 +20,10 @@
 
 #define BUFFER_SIZE 1024
 
-enum {REASON_ERROR, REASON_HANGUP, REASON_HANGUP2, REASON_READEND};
+#undef EPOLLRDHUP
+#define EPOLLRDHUP 0
+
+enum {REASON_ERROR, REASON_HANGUP, REASON_HANGUP2, REASON_READEND, REASON_PIPELINE, REASON_UNKNOWNx};
 
 typedef struct counter_t {
     uint64_t total;
@@ -32,14 +37,22 @@ typedef struct statistics_t {
         counter_t attempted;
         counter_t failed;
         counter_t succeeded;
-    } begin;
-    struct {
         counter_t error;
         counter_t read;
         counter_t hangup;
         counter_t hangup2;
+        counter_t pipeline;
         counter_t unknown;
-    } end;
+    } con;
+    struct {
+        counter_t sent;
+        counter_t recved;
+        counter_t n100;
+        counter_t n200;
+        counter_t n300;
+        counter_t n400;
+        counter_t n500;
+    } http;
 
     counter_t last;
 } statistics_t;
@@ -50,7 +63,8 @@ typedef struct myinfo_t {
     size_t request_sent;
     size_t request_length;
     struct myinfo_t *next;
-    int flag_success;
+    int is_connected;
+    http_response_t http;
 } myinfo_t;
 
 typedef struct running_t {
@@ -88,10 +102,10 @@ _info_alloc(const main_conf_t *conf, running_t *run) {
     info->next = run->active;
     run->active = info;
 
-    info->request = conf->request;
+    info->request = (char*)conf->request;
     info->request_length = conf->request_length;
     info->request_sent = 0;
-    info->flag_success = 0;
+    info->is_connected = 0;
 
     return info;
 }
@@ -118,8 +132,22 @@ get_addr_length(const struct sockaddr *target) {
     }
 }
 
+static bool
+_connection_is_sent(myinfo_t* info) {
+    return info->request_sent >= info->request_length;
+}
 
-int create_connection(const main_conf_t *conf, running_t *run) {
+static void
+_connection_send_init(myinfo_t* info) {
+    info->request_sent = 0;
+}
+static void
+_connection_recv_init(myinfo_t* info) {
+    memset(&info->http, 0, sizeof(info->http));
+}
+
+static int 
+_connection_create(const main_conf_t *conf, running_t *run) {
     socket_t fd;
     const struct sockaddr *target;
     const struct sockaddr *source;
@@ -141,8 +169,14 @@ again:
     /* create socket for this connection */
     fd = socket(target->sa_family, SOCK_STREAM, 0);
     if (fd == -1) {
-        fprintf(stderr, "[-] local error: socket(): %s\n", sock_strerror(sockerrno));
-        return -1;
+        tui_norm_screen();
+        fprintf(stderr, "[-] socket(): %s\n", sock_strerror(sockerrno));
+        switch (sockerrno) {
+        case WSA(EMFILE):
+            fprintf(stderr, "[-] FATAL: use ulimit to increase available file descriptors\n");
+            break;
+        }
+        exit(1);
     }
 
     /* Bind to a source address */
@@ -183,13 +217,13 @@ again:
 
     run->concurrency++;
     run->request_count++;
-    run->stats.begin.attempted.total++;
+    run->stats.con.attempted.total++;
 
     return 0;
 }
 
 static int
-_send_request(myinfo_t *info) {
+_connection_send(myinfo_t *info) {
     ssize_t bytes_sent;
 
     bytes_sent = send(  info->fd,
@@ -204,8 +238,51 @@ _send_request(myinfo_t *info) {
     }
 }
 
+static void
+vLOGfd(socket_t fd, const char* fmt, va_list marker) {
+    struct sockaddr_storage local_addr, remote_addr;
+    socklen_t addr_len = sizeof(struct sockaddr_storage);
+    char localhost[NI_MAXHOST], localport[NI_MAXSERV];
+    char remotehost[NI_MAXHOST], remoteport[NI_MAXSERV];
+    int err;
+
+    err = getsockname(fd, (struct sockaddr*)&local_addr, &addr_len);
+    if (err == -1) {
+        perror("getsockname failed");
+        return;
+    }
+
+    err = getpeername(fd, (struct sockaddr*)&remote_addr, &addr_len);
+    if (err == -1) {
+        perror("getpeername failed");
+        return;
+    }
+
+    err = getnameinfo((struct sockaddr*)&local_addr, addr_len, localhost, NI_MAXHOST, localport, NI_MAXSERV, NI_NUMERICHOST | NI_NUMERICSERV);
+    if (err != 0) {
+        perror("getnameinfo failed for local address");
+        return;
+    }
+
+    err = getnameinfo((struct sockaddr*)&remote_addr, addr_len, remotehost, NI_MAXHOST, remoteport, NI_MAXSERV, NI_NUMERICHOST | NI_NUMERICSERV);
+    if (err != 0) {
+        perror("getnameinfo failed for remote address");
+    }
+
+    fprintf(stderr, "[ ] [%s]:%s -> [%s]:%s: ",
+        localhost, localport, remotehost, remoteport);
+    vfprintf(stderr, fmt, marker);
+}
+static void
+LOGfd(socket_t fd, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vLOGfd(fd, fmt, args);
+    va_end(args);
+}
+
 static int
-_close_connection(running_t *run, socket_t fd, struct epoll_event *event, int reason) {
+_connection_close(running_t *run, socket_t fd, struct epoll_event *event, int reason) {
     myinfo_t *info = event->data.ptr;
     int err;
 
@@ -214,6 +291,43 @@ _close_connection(running_t *run, socket_t fd, struct epoll_event *event, int re
     if (err) {
         perror("epoll_ctl(EPOLL_CTL_DEL)");
         exit(1);
+    }
+
+
+    /* Record statistics */
+    switch (reason) {
+        case REASON_ERROR:
+            run->stats.con.error.total++;
+            int error = 0;
+            socklen_t len = sizeof(error);
+            int err;
+
+            err = getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
+            if (err < 0) {
+                tui_norm_screen();
+                fprintf(stderr, "getsockopt(): %s\n", sock_strerror(sockerrno));
+                exit(1);
+            } else {
+                tui_norm_screen();
+                LOGfd(fd, "%s\n", sock_strerror(error));
+                exit(1);
+            }
+            break;
+        case REASON_READEND:
+            run->stats.con.read.total++;
+            break;
+        case REASON_HANGUP:
+            run->stats.con.hangup.total++;
+            break;
+        case REASON_HANGUP2:
+            run->stats.con.hangup2.total++;
+            break;
+        case REASON_PIPELINE:
+            run->stats.con.hangup2.total++;
+            break;
+        default:
+            run->stats.con.unknown.total++;
+            break;
     }
 
     /* close the connection */
@@ -225,24 +339,6 @@ _close_connection(running_t *run, socket_t fd, struct epoll_event *event, int re
     /* we have one fewer concurrent connections */
     run->concurrency--;
 
-    /* Record statistics */
-    switch (reason) {
-        case REASON_ERROR:
-            run->stats.end.error.total++;
-            break;
-        case REASON_READEND:
-            run->stats.end.read.total++;
-            break;
-        case REASON_HANGUP:
-            run->stats.end.hangup.total++;
-            break;
-        case REASON_HANGUP2:
-            run->stats.end.hangup2.total++;
-            break;
-        default:
-            run->stats.end.unknown.total++;
-            break;
-    }
     return err;
 }
 
@@ -256,7 +352,7 @@ int run_loop(const main_conf_t *conf, running_t *run) {
      * of this, not optimizing startup time. */
     i=0;
     while (i++ < 10 && run->concurrency < conf->concurrent_connections) {
-        create_connection(conf, run);
+        _connection_create(conf, run);
     }
     if (run->concurrency == 0)
         return 0;
@@ -279,16 +375,20 @@ int run_loop(const main_conf_t *conf, running_t *run) {
         myinfo_t *info = (myinfo_t*)event->data.ptr;
         socket_t fd = info->fd;
 
+        /*
+        * This is where we SEND requests.
+        * This is where we detect CONNECTIONS.
+        */
         if (flags & EPOLLOUT) {
-            if (info->flag_success == 0) {
-                run->stats.begin.succeeded.total++;
-                info->flag_success = 1;
+            if (info->is_connected == 0) {
+                run->stats.con.succeeded.total++;
+                info->is_connected = true;
             }
-            _send_request(info);
+            _connection_send(info);
 
             /* If we've sent everything, then modify our record
              * so that we no longer receive this event */
-            if (info->request_sent >= info->request_length) {
+            if (_connection_is_sent(info)) {
                 int err;
                 struct epoll_event eventmod = *event;
                 eventmod.events = EPOLLIN  | EPOLLRDHUP;
@@ -298,34 +398,96 @@ int run_loop(const main_conf_t *conf, running_t *run) {
                 }
                 if (conf->is_shutdown)
                     shutdown(fd, SHUT_WR);
+                run->stats.http.sent.total++;
             }
             continue;
         }
 
 
         if (flags & EPOLLERR) {
-            _close_connection(run, fd, event, REASON_ERROR);
+            _connection_close(run, fd, event, REASON_ERROR);
+            continue;
+        }
+
+
+        /*
+         * This is where we RECEIVE responses.
+         * This is where we also will SEND requests (after
+         * receiving a complete response).
+         */
+        if (flags & EPOLLIN) {
+            unsigned char buffer[BUFFER_SIZE];
+            int bytes_read = recv(fd, buffer, sizeof(buffer) - 1, 0);
+            if (bytes_read > 0) {
+                int count;
+                int is_finished = false;
+                buffer[bytes_read] = '\0';
+                count = http_rsp_parse(&info->http, buffer, bytes_read, &is_finished);
+                if (count < (int)bytes_read) {
+                    _connection_close(run, fd, event, REASON_PIPELINE);
+                } else if (is_finished) {
+                    run->stats.http.recved.total++;
+
+                    if (flags & EPOLLHUP) {
+                        _connection_close(run, fd, event, REASON_HANGUP);
+                        continue;
+                    }
+                    if (flags & EPOLLRDHUP) {
+                        _connection_close(run, fd, event, REASON_HANGUP2);
+                        continue;
+                    }
+
+                    _connection_send_init(info);
+                    _connection_send(info);
+                    if (!_connection_is_sent(info)) {
+                        /* We haven't sent everything */
+                        int err;
+                        struct epoll_event eventmod = *event;
+                        eventmod.events = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+                        err = epoll_ctl(run->epoll_fd, EPOLL_CTL_MOD, fd, &eventmod);
+                        if (err) {
+                            perror("EPOLL_CTL_MOD");
+                        }
+                    } else {
+                        run->stats.http.sent.total++;
+                        _connection_recv_init(info);
+                    }
+                } else if (!is_finished) {
+                    /* continue waiting for the response to be finished */
+                    if (flags & EPOLLHUP) {
+                        _connection_close(run, fd, event, REASON_UNKNOWNx);
+                        continue;
+                    }
+                    if (flags & EPOLLRDHUP) {
+                        _connection_close(run, fd, event, REASON_UNKNOWNx);
+                        continue;
+                    }
+                }
+
+            } else if (bytes_read == 0) {
+                if (flags & EPOLLHUP) {
+                    _connection_close(run, fd, event, REASON_HANGUP);
+                    continue;
+                }
+                if (flags & EPOLLRDHUP) {
+                    _connection_close(run, fd, event, REASON_HANGUP2);
+                    continue;
+                }
+                _connection_close(run, fd, event, REASON_READEND);
+                continue;
+            } else if (bytes_read < 0) {
+                _connection_close(run, fd, event, REASON_ERROR);
+            }
             continue;
         }
 
         if (flags & EPOLLHUP) {
-            _close_connection(run, fd, event, REASON_HANGUP);
+            _connection_close(run, fd, event, REASON_HANGUP);
             continue;
         }
 
         if (flags & EPOLLRDHUP) {
-            _close_connection(run, fd, event, REASON_HANGUP2);
-            continue;
-        }
-
-        if (flags & EPOLLIN) {
-            char buffer[BUFFER_SIZE];
-            int bytes_read = recv(fd, buffer, sizeof(buffer) - 1, 0);
-            if (bytes_read > 0) {
-                buffer[bytes_read] = '\0';
-            } else {
-                _close_connection(run, fd, event, REASON_READEND);
-            }
+            _connection_close(run, fd, event, REASON_HANGUP2);
             continue;
         }
 
@@ -337,74 +499,33 @@ int run_loop(const main_conf_t *conf, running_t *run) {
 }
 
 #ifdef _WIN32
-LARGE_INTEGER
-getFILETIMEoffset(void)
-{
-    SYSTEMTIME s;
-    FILETIME f;
-    LARGE_INTEGER t;
-
-    s.wYear = 1970;
-    s.wMonth = 1;
-    s.wDay = 1;
-    s.wHour = 0;
-    s.wMinute = 0;
-    s.wSecond = 0;
-    s.wMilliseconds = 0;
-    SystemTimeToFileTime(&s, &f);
-    t.QuadPart = f.dwHighDateTime;
-    t.QuadPart <<= 32;
-    t.QuadPart |= f.dwLowDateTime;
-    return (t);
-}
-
 #define CLOCK_REALTIME 1
 int
-clock_gettime(int X, struct timeval* tv)
-{
-    LARGE_INTEGER           t;
-    FILETIME            f;
-    double                  microseconds;
-    static LARGE_INTEGER    offset;
-    static double           frequencyToMicroseconds;
-    static int              initialized = 0;
-    static BOOL             usePerformanceCounter = 0;
-
-    X = X;
-
-    if (!initialized) {
-        LARGE_INTEGER performanceFrequency;
-        initialized = 1;
-        usePerformanceCounter = QueryPerformanceFrequency(&performanceFrequency);
-        if (usePerformanceCounter) {
-            QueryPerformanceCounter(&offset);
-            frequencyToMicroseconds = (double)performanceFrequency.QuadPart / 1000000.;
-        }
-        else {
-            offset = getFILETIMEoffset();
-            frequencyToMicroseconds = 10.;
-        }
-    }
-    if (usePerformanceCounter) QueryPerformanceCounter(&t);
-    else {
-        GetSystemTimeAsFileTime(&f);
-        t.QuadPart = f.dwHighDateTime;
-        t.QuadPart <<= 32;
-        t.QuadPart |= f.dwLowDateTime;
+clock_gettime(int clockid, struct timespec* tp) {
+    if (clockid != CLOCK_REALTIME) {
+        return -1; // Only CLOCK_REALTIME is supported in this implementation
     }
 
-    t.QuadPart -= offset.QuadPart;
-    microseconds = (double)t.QuadPart / frequencyToMicroseconds;
-    t.QuadPart = (LONGLONG)microseconds;
-    tv->tv_sec = (long)(t.QuadPart / 1000000);
-    tv->tv_usec = t.QuadPart % 1000000;
-    return (0);
+    FILETIME ft;
+    ULARGE_INTEGER li;
+
+    GetSystemTimeAsFileTime(&ft);
+    li.LowPart = ft.dwLowDateTime;
+    li.HighPart = ft.dwHighDateTime;
+
+    // Convert FILETIME to UNIX epoch (January 1, 1970)
+    li.QuadPart -= 116444736000000000LL;
+
+    // Convert to seconds and nanoseconds
+    tp->tv_sec = (time_t)(li.QuadPart / 10000000);
+    tp->tv_nsec = (long)((li.QuadPart % 10000000) * 100);
+
+    return 0;
 }
-
 #endif
 
 static running_t *
-run_start(const main_conf_t *conf) {
+worker_start(const main_conf_t *conf) {
     size_t i;
     running_t *run;
 
@@ -482,6 +603,7 @@ void print_stats(const main_conf_t *conf, running_t *run) {
     stats_calculate_rates(run);
 
     tui_go_topleft();
+    fprintf(stderr, "[ https://github.com/robertdavidgraham/nxbench - v0.1 ] " CEOL);
     fprintf(stderr, "website: %s:%u" CEOL, conf->server_name, conf->server_port);
     fprintf(stderr, "IP:");
 
@@ -501,25 +623,33 @@ void print_stats(const main_conf_t *conf, running_t *run) {
     }
     fprintf(stderr, CEOL);
     fprintf(stderr, CEOL);
-    fprintf(stderr, "concurrency: %u" CEOL, (unsigned)run->concurrency);
+    fprintf(stderr, "concurrency: %10u" CEOL, (unsigned)run->concurrency);
     fprintf(stderr, CEOL);
-    fprintf(stderr, "requests: %u" CEOL, (unsigned)run->stats.begin.attempted.total);
-    fprintf(stderr, " success: %u" CEOL, (unsigned)run->stats.begin.succeeded.total);
-    fprintf(stderr, "    fail: %u" CEOL, (unsigned)run->stats.begin.failed.total);
-    fprintf(stderr, " req/sec: %u" CEOL, (unsigned)run->stats.begin.attempted.rate);
-    fprintf(stderr, " suc/sec: %u" CEOL, (unsigned)run->stats.begin.succeeded.rate);
-    fprintf(stderr, "fail/sec: %u" CEOL, (unsigned)run->stats.begin.failed.rate);
+#define PSTAT(name, attempted) \
+    fprintf(stderr, "%10s: %10llu   %6u/sec" CEOL, name, \
+        (unsigned long long)run->stats.con.attempted.total, \
+        (unsigned)run->stats.con.attempted.rate \
+        );
+    PSTAT("connect", attempted);
+    PSTAT("success", succeeded);
+    PSTAT("fail", failed);
+    PSTAT("error", error);
+    PSTAT("closed", read);
+    PSTAT("hangup", hangup);
+    PSTAT("hangup2", hangup2);
+    PSTAT("unknown", unknown);
+    fprintf(stderr, CEOL);
+
+#define PSTAH(name, attempted) \
+    fprintf(stderr, "%10s: %10llu   %6u/sec" CEOL, name, \
+        (unsigned long long)run->stats.http.attempted.total, \
+        (unsigned)run->stats.http.attempted.rate \
+        );
+    PSTAH("sent", sent);
+    PSTAH("recv", recved);
 
     fprintf(stderr, CEOL);
-    fprintf(stderr, "  error: %u" CEOL, (unsigned)run->stats.end.error.total);
-    fprintf(stderr, "   read: %u" CEOL, (unsigned)run->stats.end.read.total);
-    fprintf(stderr, " hangup: %u" CEOL, (unsigned)run->stats.end.hangup.total);
-    fprintf(stderr, "hangup2: %u" CEOL, (unsigned)run->stats.end.hangup2.total);
 
-    fprintf(stderr, "  error/sec: %u" CEOL, (unsigned)run->stats.end.error.rate);
-    fprintf(stderr, "   read/sec: %u" CEOL, (unsigned)run->stats.end.read.rate);
-    fprintf(stderr, " hangup/sec: %u" CEOL, (unsigned)run->stats.end.hangup.rate);
-    fprintf(stderr, "hangup2/sec: %u" CEOL, (unsigned)run->stats.end.hangup2.rate);
 
 }
 int main(int argc, char *argv[]) {
@@ -536,6 +666,12 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
+    http_rsp_init();
+    if (http_rsp_selftest() != 0) {
+        fprintf(stderr, "[-] FATAL: programing error in http response\n");
+        exit(1);
+    }
+
     /*
      * this parses the configuration parameters from
      * the command-line. After this point, all the configuration
@@ -543,8 +679,11 @@ int main(int argc, char *argv[]) {
      * of the program.
      */
     conf = main_conf_read(argc, argv);
-    if (conf == NULL)
+    if (conf == NULL) {
+        fprintf(stderr, "-] FATAL: error reading configuration\n");
         return 1;
+    }
+
 
     /*
      * Make sure all IP addresses are reachable, including that the
@@ -563,7 +702,7 @@ int main(int argc, char *argv[]) {
      * create a running job object that will contain
      * all the chaning information during a run
      */
-    run = run_start(conf);
+    run = worker_start(conf);
     if (run == NULL)
         return 1;
 

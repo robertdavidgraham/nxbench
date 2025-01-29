@@ -1,4 +1,5 @@
 #include "main-conf.h"
+#include "http-request.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -6,12 +7,31 @@
 
 #ifdef _WIN32
 #include "win-sockets.h"
+#include <direct.h>
+#define getcwd _getcwd
 #else
 #include <unistd.h>
 #include "unix-sockets.h"
 #endif
 
+static int
+_set_parm(main_conf_t* conf, const char* name, const char* value);
 
+
+/***************************************************************************
+ * remove leading/trailing whitespace
+ ***************************************************************************/
+static void
+trim(char* line, size_t sizeof_line)
+{
+    if (sizeof_line > strlen(line))
+        sizeof_line = strlen(line);
+
+    while (isspace(*line & 0xFF))
+        memmove(line, line + 1, sizeof_line--);
+    while (*line && isspace(line[sizeof_line - 1] & 0xFF))
+        line[--sizeof_line] = '\0';
+}
 
 
 static int
@@ -139,6 +159,52 @@ _add_sources(main_conf_t* conf, const char* value) {
 }
 
 static int
+conf_file(main_conf_t* conf, const char* filename) {
+
+    FILE* fp;
+    char line[65536];
+
+    fp = fopen(filename, "rt");
+    if (fp == NULL) {
+        char dir[512];
+        char* x;
+
+        fprintf(stderr, "[-] FAIL: reading configuration file\n");
+        fprintf(stderr, "[-] %s: %s\n", filename, strerror(errno));
+
+        x = getcwd(dir, sizeof(dir));
+        if (x)
+            fprintf(stderr, "[-] cwd = %s\n", dir);
+        return 1;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char* name;
+        char* value;
+
+        trim(line, sizeof(line));
+
+        if (ispunct(line[0] & 0xFF) || line[0] == '\0')
+            continue;
+
+        name = line;
+        value = strchr(line, '=');
+        if (value == NULL)
+            continue;
+        *value = '\0';
+        value++;
+        trim(name, sizeof(line));
+        trim(value, sizeof(line));
+
+        _set_parm(conf, name, value);
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+
+static int
 _parse_url(main_conf_t *conf, const char *url) {
     size_t offset = 0;
     size_t hostname_offset;
@@ -146,9 +212,12 @@ _parse_url(main_conf_t *conf, const char *url) {
     size_t path_offset;
     size_t path_length;
 
-    if (memcmp(url, "http://", 7) != 0) {
+    if (memcmp(url, "https://", 8) == 0) {
+        fprintf(stderr, "[-] FATAL: SSL not yet supported\n");
+        exit(1);
+    } else if (memcmp(url, "http://", 7) != 0) {
         return 1;
-    } else
+    } else 
         offset = 7;
 
     /* Strip any additional leading slashes */
@@ -159,12 +228,23 @@ _parse_url(main_conf_t *conf, const char *url) {
 
     /* get the host */
     hostname_offset = offset;
-    while (url[offset] && (url[offset] != '/' || url[offset] == '\\'))
+    while (url[offset] && (url[offset] != '/' || url[offset] == '\\') && url[offset] != ':')
         offset++;
     hostname_length = offset - hostname_offset;
     conf->server_name = malloc(hostname_length+1);
     memcpy(conf->server_name, url + hostname_offset, hostname_length);
     conf->server_name[hostname_length] = '\0';
+
+    /* get the port */
+    if (url[offset] == ':') {
+        offset++;
+        conf->server_port = 0;
+        while (isdigit(url[offset])) {
+            conf->server_port *= 10;
+            conf->server_port += url[offset] - '0';
+            offset++;
+        }
+    }
 
     /* get the path */
     path_offset = offset;
@@ -179,6 +259,14 @@ _parse_url(main_conf_t *conf, const char *url) {
         conf->path[0] = '/';
     }
 
+    conf->request_length = http_edit_request(
+        &conf->request, conf->request_length,
+        "url", 3,
+        conf->path, path_length);
+    conf->request_length = http_edit_request(
+        &conf->request, conf->request_length,
+        "Host", 4,
+        conf->server_name, hostname_length);
     return 0;
 }
 
@@ -237,6 +325,19 @@ _set_parm(main_conf_t *conf, const char *name, const char *value) {
         return 0;
     }
 
+    if (is_equal(name, "conf")) {
+        conf_file(conf, value);
+        return 1;
+    }
+
+    if (memcmp(name, "http-", 5) == 0) {
+        conf->request_length = http_edit_request(
+            &conf->request, conf->request_length,
+            name + 5, 0,
+            value, 0);
+        return 1;
+    }
+
     return 0;
 }
 
@@ -249,11 +350,16 @@ char *_append(char *lhs, size_t *lhs_length, const char *rhs) {
     return lhs;
 }
 
+
+
+
 main_conf_t *
 main_conf_read(int argc, char *argv[]) {
     int i;
     int err;
     main_conf_t *conf;
+
+    http_edit_request_selftest();
 
     conf = calloc(1, sizeof(*conf));
     conf->server_port = 80;
@@ -302,6 +408,11 @@ main_conf_read(int argc, char *argv[]) {
         }
     }
 
+    if (conf->server_name == NULL) {
+        fprintf(stderr, "[-] FATAL: no URL was specified\n");
+        exit(1);
+    }
+
     if (conf->concurrent_connections == 0)
         conf->concurrent_connections = 1;
 
@@ -322,15 +433,6 @@ main_conf_read(int argc, char *argv[]) {
         }
     }
 
-    conf->request = _append(conf->request, &conf->request_length, "GET ");
-    conf->request = _append(conf->request, &conf->request_length, conf->path);
-    conf->request = _append(conf->request, &conf->request_length, " HTTP/1.1\r\n");
-    conf->request = _append(conf->request, &conf->request_length, "Host: ");
-    conf->request = _append(conf->request, &conf->request_length, conf->server_name);
-    conf->request = _append(conf->request, &conf->request_length, "\r\n");
-    conf->request = _append(conf->request, &conf->request_length, "User-Agent: nxbench/1.0\r\n");
-    conf->request = _append(conf->request, &conf->request_length, "Accept: */*\r\n");
-    conf->request = _append(conf->request, &conf->request_length, "\r\n");
 
 
     return conf;

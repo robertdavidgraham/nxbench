@@ -25,8 +25,8 @@ static void say(const char *str) {
 
 static void _tui_hide_cursor(void) { say("\033[?25l"); }
 static void _tui_norm_cursor(void) { say("\033[?25h"); }
-static void _tui_alt_screen(void) { say("\033[?1049h\033[H"); }
-static void _tui_norm_screen(void) { say("\033[?1049l"); }
+void tui_alt_screen(void) { say("\033[?1049h\033[H"); }
+void tui_norm_screen(void) { say("\033[?1049l"); }
 void tui_clear_screen(void) { say("\033[1;1H\033[2J");}
 void tui_go_topleft(void) { say("\033[1;1H"); }
 void tui_clear_eol(void) { say("\033[K"); }
@@ -36,7 +36,7 @@ static void
 _tui_cleanup(void) {
     /* Restore original screen */
     if (tui.is_alternate_buffer) {
-        _tui_norm_screen();
+        tui_norm_screen();
     }
 
     /* Restore cursor to blinking */
@@ -60,7 +60,7 @@ int tui_init(int is_alternate_buffer) {
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
     if (tui.is_alternate_buffer) {
-        _tui_alt_screen();
+        tui_alt_screen();
     }
     _tui_hide_cursor();
 

@@ -12,5 +12,8 @@ void tui_clear_screen(void);
 void tui_go_topleft(void);
 void tui_clear_eol(void);
 
+void tui_alt_screen(void);
+void tui_norm_screen(void);
+
 
 #endif

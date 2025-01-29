@@ -9,7 +9,7 @@ typedef struct main_conf_t {
     char *server_name;
     char *path;
     unsigned server_port;
-    char *request;
+    unsigned char *request;
     size_t request_length;
 
     /* The list of target IP addresses, often only a single
